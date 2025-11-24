@@ -1,13 +1,4 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
-
-/**
- * @title StabiCore Network
- * @dev A decentralized stability network for managing stable assets and governance
- */
-contract StabiCoreNetwork {
-    
-    // State variables
+State variables
     address public owner;
     uint256 public totalStaked;
     uint256 public rewardRate;
@@ -38,17 +29,7 @@ contract StabiCoreNetwork {
     uint256 public proposalCount;
     address[] public stakeHolderList;
     
-    // Events
-    event Staked(address indexed user, uint256 amount);
-    event Unstaked(address indexed user, uint256 amount);
-    event RewardsClaimed(address indexed user, uint256 amount);
-    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, string description);
-    event Voted(uint256 indexed proposalId, address indexed voter, bool support);
-    event ProposalExecuted(uint256 indexed proposalId);
-    event StabilityFundDeposited(address indexed depositor, uint256 amount);
-    event EmergencyWithdraw(address indexed user, uint256 amount);
-    
-    // Modifiers
+    Modifiers
     modifier onlyOwner() {
         require(msg.sender == owner, "Not authorized");
         _;
@@ -272,3 +253,6 @@ contract StabiCoreNetwork {
         stabilityFund += msg.value;
     }
 }
+// 
+End
+// 
