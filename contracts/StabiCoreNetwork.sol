@@ -248,11 +248,8 @@ State variables
         return stakeHolderList.length;
     }
     
-    // Fallback function to receive Ether
-    receive() external payable {
-        stabilityFund += msg.value;
-    }
-}
+    End
+// 
 // 
 End
 // 
