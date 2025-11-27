@@ -1,256 +1,163 @@
-State variables
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.21;
+
+/**
+ * @title StabiCore Network
+ * @notice Collateral-backed stablecoin system
+ *         - Mint/burn stablecoins
+ *         - Deposit ERC20 collateral
+ *         - Stability fees / interest
+ *         - Governance-controlled parameters
+ */
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address user) external view returns (uint256);
+}
+
+contract StabiCoreNetwork {
     address public owner;
-    uint256 public totalStaked;
-    uint256 public rewardRate;
-    uint256 public stabilityFund;
-    bool public paused;
-    
-    struct StakeHolder {
-        uint256 stakedAmount;
-        uint256 stakingTimestamp;
-        uint256 rewardsEarned;
-        bool isActive;
+    IERC20 public stablecoin; // The network stablecoin
+
+    uint256 public stabilityFee = 5; // 5% annual, simple model
+    uint256 public constant BLOCKS_PER_YEAR = 2102400;
+
+    struct Collateral {
+        address token;
+        uint256 amount;
     }
-    
-    struct Proposal {
-        uint256 id;
-        string description;
-        uint256 votesFor;
-        uint256 votesAgainst;
-        uint256 deadline;
-        bool executed;
-        address proposer;
+
+    struct Position {
+        address owner;
+        Collateral[] collaterals;
+        uint256 debt; // stablecoins minted
+        uint256 lastUpdateBlock;
+        bool active;
     }
-    
-    mapping(address => StakeHolder) public stakeHolders;
-    mapping(uint256 => Proposal) public proposals;
-    mapping(address => mapping(uint256 => bool)) public hasVoted;
-    
-    uint256 public proposalCount;
-    address[] public stakeHolderList;
-    
-    Modifiers
+
+    uint256 public positionCount;
+    mapping(uint256 => Position) public positions;
+    mapping(address => uint256[]) public userPositions;
+
+    event PositionOpened(uint256 indexed id, address indexed owner);
+    event CollateralDeposited(uint256 indexed id, address token, uint256 amount);
+    event StablecoinMinted(uint256 indexed id, uint256 amount);
+    event StablecoinBurned(uint256 indexed id, uint256 amount);
+    event StabilityFeeUpdated(uint256 newFee);
+
     modifier onlyOwner() {
-        require(msg.sender == owner, "Not authorized");
+        require(msg.sender == owner, "Not owner");
         _;
     }
-    
-    modifier whenNotPaused() {
-        require(!paused, "Contract is paused");
+
+    modifier validPosition(uint256 id) {
+        require(positions[id].active, "Invalid position");
         _;
     }
-    
-    constructor(uint256 _rewardRate) {
+
+    constructor(address _stablecoin) {
         owner = msg.sender;
-        rewardRate = _rewardRate;
-        paused = false;
+        stablecoin = IERC20(_stablecoin);
     }
-    
-    /**
-     * @dev Function 1: Stake tokens into the network
-     */
-    function stake() external payable whenNotPaused {
-        require(msg.value > 0, "Cannot stake 0");
-        
-        StakeHolder storage holder = stakeHolders[msg.sender];
-        
-        if (!holder.isActive) {
-            stakeHolderList.push(msg.sender);
-            holder.isActive = true;
+
+    // ------------------------------------------------
+    // POSITION FUNCTIONS
+    // ------------------------------------------------
+    function openPosition() external returns (uint256) {
+        positionCount++;
+        positions[positionCount] = Position({
+            owner: msg.sender,
+            collaterals: new Collateral ,
+            debt: 0,
+            lastUpdateBlock: block.number,
+            active: true
+        });
+
+        userPositions[msg.sender].push(positionCount);
+        emit PositionOpened(positionCount, msg.sender);
+        return positionCount;
+    }
+
+    function depositCollateral(uint256 positionId, address token, uint256 amount) external validPosition(positionId) {
+        Position storage pos = positions[positionId];
+        require(pos.owner == msg.sender, "Not owner");
+
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+        pos.collaterals.push(Collateral({token: token, amount: amount}));
+
+        emit CollateralDeposited(positionId, token, amount);
+    }
+
+    function mintStablecoin(uint256 positionId, uint256 amount) external validPosition(positionId) {
+        Position storage pos = positions[positionId];
+        require(pos.owner == msg.sender, "Not owner");
+        _accrueStabilityFee(pos);
+
+        // Check simple collateralization: total collateral value > debt (simplified)
+        uint256 totalCollateral = _totalCollateralValue(pos);
+        require(totalCollateral >= pos.debt + amount, "Undercollateralized");
+
+        pos.debt += amount;
+        stablecoin.transfer(msg.sender, amount);
+        pos.lastUpdateBlock = block.number;
+
+        emit StablecoinMinted(positionId, amount);
+    }
+
+    function burnStablecoin(uint256 positionId, uint256 amount) external validPosition(positionId) {
+        Position storage pos = positions[positionId];
+        require(pos.owner == msg.sender, "Not owner");
+        _accrueStabilityFee(pos);
+
+        require(amount <= pos.debt, "Exceeds debt");
+        stablecoin.transferFrom(msg.sender, address(this), amount);
+        pos.debt -= amount;
+        pos.lastUpdateBlock = block.number;
+
+        emit StablecoinBurned(positionId, amount);
+    }
+
+    // ------------------------------------------------
+    // INTERNAL HELPERS
+    // ------------------------------------------------
+    function _accrueStabilityFee(Position storage pos) internal {
+        uint256 blocksPassed = block.number - pos.lastUpdateBlock;
+        if (blocksPassed == 0 || pos.debt == 0) return;
+
+        uint256 fee = pos.debt * stabilityFee * blocksPassed / (100 * BLOCKS_PER_YEAR);
+        pos.debt += fee;
+    }
+
+    function _totalCollateralValue(Position storage pos) internal view returns (uint256 total) {
+        for (uint256 i = 0; i < pos.collaterals.length; i++) {
+            total += pos.collaterals[i].amount; // Simplified: 1:1 token value
         }
-        
-        if (holder.stakedAmount > 0) {
-            holder.rewardsEarned += calculateRewards(msg.sender);
-        }
-        
-        holder.stakedAmount += msg.value;
-        holder.stakingTimestamp = block.timestamp;
-        totalStaked += msg.value;
-        
-        emit Staked(msg.sender, msg.value);
     }
-    
-    /**
-     * @dev Function 2: Unstake tokens from the network
-     */
-    function unstake(uint256 _amount) external whenNotPaused {
-        StakeHolder storage holder = stakeHolders[msg.sender];
-        require(holder.stakedAmount >= _amount, "Insufficient staked amount");
-        
-        holder.rewardsEarned += calculateRewards(msg.sender);
-        holder.stakedAmount -= _amount;
-        holder.stakingTimestamp = block.timestamp;
-        totalStaked -= _amount;
-        
-        payable(msg.sender).transfer(_amount);
-        
-        emit Unstaked(msg.sender, _amount);
+
+    // ------------------------------------------------
+    // VIEWERS
+    // ------------------------------------------------
+    function getUserPositions(address user) external view returns (uint256[] memory) {
+        return userPositions[user];
     }
-    
-    /**
-     * @dev Function 3: Calculate rewards for a stakeholder
-     */
-    function calculateRewards(address _staker) public view returns (uint256) {
-        StakeHolder memory holder = stakeHolders[_staker];
-        if (holder.stakedAmount == 0) return 0;
-        
-        uint256 stakingDuration = block.timestamp - holder.stakingTimestamp;
-        uint256 rewards = (holder.stakedAmount * rewardRate * stakingDuration) / (365 days * 100);
-        
-        return rewards;
+
+    function getPositionDebt(uint256 positionId) external view returns (uint256) {
+        Position storage pos = positions[positionId];
+        uint256 blocksPassed = block.number - pos.lastUpdateBlock;
+        uint256 fee = pos.debt * stabilityFee * blocksPassed / (100 * BLOCKS_PER_YEAR);
+        return pos.debt + fee;
     }
-    
-    /**
-     * @dev Function 4: Claim accumulated rewards
-     */
-    function claimRewards() external whenNotPaused {
-        StakeHolder storage holder = stakeHolders[msg.sender];
-        
-        uint256 rewards = calculateRewards(msg.sender) + holder.rewardsEarned;
-        require(rewards > 0, "No rewards to claim");
-        require(address(this).balance >= rewards, "Insufficient contract balance");
-        
-        holder.rewardsEarned = 0;
-        holder.stakingTimestamp = block.timestamp;
-        
-        payable(msg.sender).transfer(rewards);
-        
-        emit RewardsClaimed(msg.sender, rewards);
+
+    // ------------------------------------------------
+    // ADMIN
+    // ------------------------------------------------
+    function updateStabilityFee(uint256 newFee) external onlyOwner {
+        stabilityFee = newFee;
+        emit StabilityFeeUpdated(newFee);
     }
-    
-    /**
-     * @dev Function 5: Create a governance proposal
-     */
-    function createProposal(string memory _description, uint256 _votingPeriod) external {
-        require(stakeHolders[msg.sender].stakedAmount > 0, "Must be a stakeholder");
-        
-        proposalCount++;
-        Proposal storage newProposal = proposals[proposalCount];
-        newProposal.id = proposalCount;
-        newProposal.description = _description;
-        newProposal.deadline = block.timestamp + _votingPeriod;
-        newProposal.proposer = msg.sender;
-        
-        emit ProposalCreated(proposalCount, msg.sender, _description);
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        owner = newOwner;
     }
-    
-    /**
-     * @dev Function 6: Vote on a proposal
-     */
-    function vote(uint256 _proposalId, bool _support) external {
-        require(stakeHolders[msg.sender].stakedAmount > 0, "Must be a stakeholder");
-        require(!hasVoted[msg.sender][_proposalId], "Already voted");
-        
-        Proposal storage proposal = proposals[_proposalId];
-        require(block.timestamp < proposal.deadline, "Voting period ended");
-        require(!proposal.executed, "Proposal already executed");
-        
-        uint256 votingPower = stakeHolders[msg.sender].stakedAmount;
-        
-        if (_support) {
-            proposal.votesFor += votingPower;
-        } else {
-            proposal.votesAgainst += votingPower;
-        }
-        
-        hasVoted[msg.sender][_proposalId] = true;
-        
-        emit Voted(_proposalId, msg.sender, _support);
-    }
-    
-    /**
-     * @dev Function 7: Execute a proposal after voting period
-     */
-    function executeProposal(uint256 _proposalId) external {
-        Proposal storage proposal = proposals[_proposalId];
-        require(block.timestamp >= proposal.deadline, "Voting period not ended");
-        require(!proposal.executed, "Proposal already executed");
-        require(proposal.votesFor > proposal.votesAgainst, "Proposal rejected");
-        
-        proposal.executed = true;
-        
-        emit ProposalExecuted(_proposalId);
-    }
-    
-    /**
-     * @dev Function 8: Deposit funds into stability fund
-     */
-    function depositStabilityFund() external payable {
-        require(msg.value > 0, "Cannot deposit 0");
-        stabilityFund += msg.value;
-        
-        emit StabilityFundDeposited(msg.sender, msg.value);
-    }
-    
-    /**
-     * @dev Function 9: Update reward rate (only owner)
-     */
-    function updateRewardRate(uint256 _newRate) external onlyOwner {
-        require(_newRate > 0 && _newRate <= 100, "Invalid reward rate");
-        rewardRate = _newRate;
-    }
-    
-    /**
-     * @dev Function 10: Emergency pause/unpause contract (only owner)
-     */
-    function togglePause() external onlyOwner {
-        paused = !paused;
-    }
-    
-    /**
-     * @dev Get stakeholder information
-     */
-    function getStakeHolderInfo(address _staker) external view returns (
-        uint256 stakedAmount,
-        uint256 stakingTimestamp,
-        uint256 rewardsEarned,
-        uint256 pendingRewards,
-        bool isActive
-    ) {
-        StakeHolder memory holder = stakeHolders[_staker];
-        return (
-            holder.stakedAmount,
-            holder.stakingTimestamp,
-            holder.rewardsEarned,
-            calculateRewards(_staker),
-            holder.isActive
-        );
-    }
-    
-    /**
-     * @dev Get proposal details
-     */
-    function getProposal(uint256 _proposalId) external view returns (
-        uint256 id,
-        string memory description,
-        uint256 votesFor,
-        uint256 votesAgainst,
-        uint256 deadline,
-        bool executed,
-        address proposer
-    ) {
-        Proposal memory proposal = proposals[_proposalId];
-        return (
-            proposal.id,
-            proposal.description,
-            proposal.votesFor,
-            proposal.votesAgainst,
-            proposal.deadline,
-            proposal.executed,
-            proposal.proposer
-        );
-    }
-    
-    /**
-     * @dev Get total number of stakeholders
-     */
-    function getTotalStakeHolders() external view returns (uint256) {
-        return stakeHolderList.length;
-    }
-    
-    End
-End
-// 
-// 
-End
-// 
+}
