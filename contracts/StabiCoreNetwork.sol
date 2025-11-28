@@ -73,5 +73,5 @@ The network stablecoin
     }
 }
 // 
-End
+Contract End
 // 
